@@ -36,3 +36,5 @@ htmlcov/
 eda_reports/
 *.log
 *.tmp
+
+DbConnector.py
