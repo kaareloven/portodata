@@ -38,4 +38,4 @@ eda_reports/
 *.log
 *.tmp
 
-DbConnector.py
+DbConnector.py 
