@@ -500,7 +500,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 		"-v",
 		"--verbose",
 		action="count",
-		default=0,
+		default=2,
 		help="Increase logging verbosity (-v, -vv)",
 	)
 	return parser

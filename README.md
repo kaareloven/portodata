@@ -11,6 +11,13 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Local mysql setup
+Done on Macbook Pro with Apple silicone
+
+1. Install Docker desktop
+2. Run ```docker pull mysql:latest```
+3. Run ```docker run -p 3306:3306 --name <container-name> -e MYSQL_ROOT_PASSWORD="<your-password> -e MYSQL_DATABASE=<db-name> -d mysql:latest"```
+
 ## Run EDA
 
 ```bash
