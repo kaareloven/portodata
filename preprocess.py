@@ -19,12 +19,14 @@ from __future__ import annotations
 import argparse
 import ast
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from haversine import Unit, haversine
+from mysql.connector import errors as mysql_errors
 
 from DbConnector import DbConnector
 
@@ -34,6 +36,13 @@ from DbConnector import DbConnector
 
 POINT_INTERVAL_SECONDS = 15
 DEFAULT_CHUNK_SIZE = 10_000
+MAX_REASONABLE_DISTANCE_M = 200_000  # ~200 km
+MAX_REASONABLE_SPEED_KMH = 160.0
+MAX_REASONABLE_DURATION_S = 6 * 60 * 60  # 6 hours
+LOCK_WAIT_TIMEOUT_SECONDS = 120
+DB_LOCK_RETRY_ERRNOS = {1205, 1213}
+MAX_DB_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -53,8 +62,10 @@ class TripRecord:
 	missing_data: bool
 	total_distance_m: Optional[float]
 	duration_seconds: Optional[int]
+	average_speed_kmh: Optional[float]
 	point_count: int
 	is_valid: bool
+	is_outlier: bool
 	start_longitude: Optional[float]
 	start_latitude: Optional[float]
 	end_longitude: Optional[float]
@@ -105,8 +116,10 @@ CREATE TABLE IF NOT EXISTS trips (
 	missing_data BOOLEAN NOT NULL,
 	total_distance_m DOUBLE NULL,
 	duration_seconds INT NULL,
+	average_speed_kmh DOUBLE NULL,
 	point_count INT NOT NULL,
 	is_valid BOOLEAN NOT NULL,
+	is_outlier BOOLEAN NOT NULL,
 	start_longitude DOUBLE NULL,
 	start_latitude DOUBLE NULL,
 	end_longitude DOUBLE NULL,
@@ -116,8 +129,21 @@ CREATE TABLE IF NOT EXISTS trips (
 	INDEX idx_trips_call_type (call_type, day_type),
 	INDEX idx_trips_start_end (start_time, end_time),
 	INDEX idx_trips_start_coords (start_latitude, start_longitude),
-	INDEX idx_trips_end_coords (end_latitude, end_longitude)
-);
+	INDEX idx_trips_end_coords (end_latitude, end_longitude),
+	INDEX idx_trips_valid (is_valid, is_outlier),
+	INDEX idx_trips_client (client_id),
+	INDEX idx_trips_stand (stand_id),
+	CONSTRAINT fk_trips_taxi FOREIGN KEY (taxi_id)
+		REFERENCES taxis(taxi_id),
+	CONSTRAINT fk_trips_client FOREIGN KEY (client_id)
+		REFERENCES clients(client_id),
+	CONSTRAINT fk_trips_stand FOREIGN KEY (stand_id)
+		REFERENCES stands(stand_id),
+	CONSTRAINT fk_trips_call_type FOREIGN KEY (call_type)
+		REFERENCES call_types(call_type),
+	CONSTRAINT fk_trips_day_type FOREIGN KEY (day_type)
+		REFERENCES day_types(day_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
 
@@ -128,22 +154,116 @@ CREATE TABLE IF NOT EXISTS trip_points (
 	point_time DATETIME NOT NULL,
 	latitude DOUBLE NOT NULL,
 	longitude DOUBLE NOT NULL,
+	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 	PRIMARY KEY (trip_id, point_seq),
 	INDEX idx_trip_points_time (point_time),
 	INDEX idx_trip_points_lat_lon (latitude, longitude),
 	CONSTRAINT fk_trip_points_trip FOREIGN KEY (trip_id)
 		REFERENCES trips(trip_id)
 		ON DELETE CASCADE
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
 
+TAXIS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS taxis (
+	taxi_id INT PRIMARY KEY,
+	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+
+CLIENTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS clients (
+	client_id BIGINT PRIMARY KEY,
+	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+
+STANDS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS stands (
+	stand_id INT PRIMARY KEY,
+	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+
+CALL_TYPES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS call_types (
+	call_type CHAR(1) PRIMARY KEY,
+	description VARCHAR(255) NOT NULL,
+	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+
+DAY_TYPES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS day_types (
+	day_type CHAR(1) PRIMARY KEY,
+	description VARCHAR(255) NOT NULL,
+	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+
+VALID_TRIPS_VIEW_SQL = """
+CREATE OR REPLACE VIEW valid_trips AS
+SELECT *
+FROM trips
+WHERE is_valid = TRUE AND is_outlier = FALSE;
+"""
+
+
+CALL_TYPE_LOOKUP = {
+	"A": "Dispatched by the central",
+	"B": "Hailed directly on the street",
+	"C": "Picked up from a taxi stand",
+}
+
+
+DAY_TYPE_LOOKUP = {
+	"A": "Workday",
+	"B": "Weekend",
+	"C": "Holiday or special day",
+}
+
+
+def ensure_lookup_tables(cursor) -> None:
+	for code, description in CALL_TYPE_LOOKUP.items():
+		cursor.execute(
+			"""
+			INSERT INTO call_types (call_type, description)
+			VALUES (%s, %s)
+			ON DUPLICATE KEY UPDATE description = VALUES(description)
+			""",
+			(code, description),
+		)
+
+	for code, description in DAY_TYPE_LOOKUP.items():
+		cursor.execute(
+			"""
+			INSERT INTO day_types (day_type, description)
+			VALUES (%s, %s)
+			ON DUPLICATE KEY UPDATE description = VALUES(description)
+			""",
+			(code, description),
+		)
+
+
 def ensure_schema(cursor) -> None:
-	"""Create the trips and trip_points tables if they don't already exist."""
+	"""Create the data warehouse schema if it doesn't already exist."""
 
 	logging.info("Ensuring database schema is present")
+	cursor.execute(TAXIS_TABLE_SQL)
+	cursor.execute(CLIENTS_TABLE_SQL)
+	cursor.execute(STANDS_TABLE_SQL)
+	cursor.execute(CALL_TYPES_TABLE_SQL)
+	cursor.execute(DAY_TYPES_TABLE_SQL)
+	ensure_lookup_tables(cursor)
 	cursor.execute(TRIPS_TABLE_SQL)
 	cursor.execute(TRIP_POINTS_TABLE_SQL)
+	cursor.execute(VALID_TRIPS_VIEW_SQL)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +280,15 @@ def _safe_int(value: str) -> Optional[int]:
 		return int(value)
 	except ValueError:
 		return None
+
+
+def _safe_char(value: Optional[str]) -> Optional[str]:
+	if value is None:
+		return None
+	value = str(value).strip()
+	if not value:
+		return None
+	return value[0].upper()
 
 
 def parse_polyline(polyline_str: str) -> List[Tuple[float, float]]:
@@ -215,6 +344,19 @@ def make_trip_record(row) -> Tuple[TripRecord, List[TripPointRecord]]:
 	start_time = datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
 
 	total_distance_m, duration_seconds = compute_distance_and_duration(points)
+	average_speed_kmh: Optional[float] = None
+	if total_distance_m is not None and total_distance_m > 0 and duration_seconds and duration_seconds > 0:
+		average_speed_kmh = (total_distance_m / 1000.0) / (duration_seconds / 3600.0)
+
+	missing_data_flag = str(row.MISSING_DATA).strip().lower() == "true"
+
+	is_outlier = False
+	if total_distance_m is not None and total_distance_m > MAX_REASONABLE_DISTANCE_M:
+		is_outlier = True
+	if duration_seconds is not None and duration_seconds > MAX_REASONABLE_DURATION_S:
+		is_outlier = True
+	if average_speed_kmh is not None and average_speed_kmh > MAX_REASONABLE_SPEED_KMH:
+		is_outlier = True
 
 	end_time: Optional[datetime] = None
 	if point_count >= 1:
@@ -223,17 +365,19 @@ def make_trip_record(row) -> Tuple[TripRecord, List[TripPointRecord]]:
 	trip_record = TripRecord(
 		trip_id=int(row.TRIP_ID),
 		taxi_id=_safe_int(row.TAXI_ID) or 0,
-		call_type=(row.CALL_TYPE or None),
+		call_type=_safe_char(row.CALL_TYPE),
 		client_id=_safe_int(row.ORIGIN_CALL),
 		stand_id=_safe_int(row.ORIGIN_STAND),
 		start_time=start_time.replace(tzinfo=None),  # store as naive UTC
 		end_time=end_time.replace(tzinfo=None) if end_time else None,
-		day_type=(row.DAY_TYPE or None),
-		missing_data=str(row.MISSING_DATA).strip().lower() == "true",
+		day_type=_safe_char(row.DAY_TYPE),
+		missing_data=missing_data_flag,
 		total_distance_m=total_distance_m,
 		duration_seconds=duration_seconds,
+		average_speed_kmh=average_speed_kmh,
 		point_count=point_count,
-		is_valid=point_count >= 3,
+		is_valid=(point_count >= 3 and not missing_data_flag and not is_outlier),
+		is_outlier=is_outlier,
 		start_longitude=points[0][0] if point_count else None,
 		start_latitude=points[0][1] if point_count else None,
 		end_longitude=points[-1][0] if point_count else None,
@@ -271,12 +415,12 @@ def upsert_trips(cursor, trip_records: Sequence[TripRecord]) -> None:
 	INSERT INTO trips (
 		trip_id, taxi_id, call_type, client_id, stand_id,
 		start_time, end_time, day_type, missing_data,
-		total_distance_m, duration_seconds, point_count, is_valid,
+		total_distance_m, duration_seconds, average_speed_kmh, point_count, is_valid, is_outlier,
 		start_longitude, start_latitude, end_longitude, end_latitude
 	) VALUES (
 		%(trip_id)s, %(taxi_id)s, %(call_type)s, %(client_id)s, %(stand_id)s,
 		%(start_time)s, %(end_time)s, %(day_type)s, %(missing_data)s,
-		%(total_distance_m)s, %(duration_seconds)s, %(point_count)s, %(is_valid)s,
+		%(total_distance_m)s, %(duration_seconds)s, %(average_speed_kmh)s, %(point_count)s, %(is_valid)s, %(is_outlier)s,
 		%(start_longitude)s, %(start_latitude)s, %(end_longitude)s, %(end_latitude)s
 	)
 	ON DUPLICATE KEY UPDATE
@@ -290,8 +434,10 @@ def upsert_trips(cursor, trip_records: Sequence[TripRecord]) -> None:
 		missing_data = VALUES(missing_data),
 		total_distance_m = VALUES(total_distance_m),
 		duration_seconds = VALUES(duration_seconds),
+		average_speed_kmh = VALUES(average_speed_kmh),
 		point_count = VALUES(point_count),
 		is_valid = VALUES(is_valid),
+		is_outlier = VALUES(is_outlier),
 		start_longitude = VALUES(start_longitude),
 		start_latitude = VALUES(start_latitude),
 		end_longitude = VALUES(end_longitude),
@@ -311,8 +457,10 @@ def upsert_trips(cursor, trip_records: Sequence[TripRecord]) -> None:
 			"missing_data": trip.missing_data,
 			"total_distance_m": trip.total_distance_m,
 			"duration_seconds": trip.duration_seconds,
+			"average_speed_kmh": trip.average_speed_kmh,
 			"point_count": trip.point_count,
 			"is_valid": trip.is_valid,
+			"is_outlier": trip.is_outlier,
 			"start_longitude": trip.start_longitude,
 			"start_latitude": trip.start_latitude,
 			"end_longitude": trip.end_longitude,
@@ -363,6 +511,33 @@ def insert_trip_points(cursor, point_records: Sequence[TripPointRecord]) -> None
 	]
 
 	cursor.executemany(sql, data)
+
+
+def upsert_taxis(cursor, taxi_ids: Set[int]) -> None:
+	if not taxi_ids:
+		return
+
+	sql = "INSERT IGNORE INTO taxis (taxi_id) VALUES (%s)"
+	params = [(taxi_id,) for taxi_id in sorted(taxi_ids)]
+	cursor.executemany(sql, params)
+
+
+def upsert_clients(cursor, client_ids: Set[int]) -> None:
+	if not client_ids:
+		return
+
+	sql = "INSERT IGNORE INTO clients (client_id) VALUES (%s)"
+	params = [(client_id,) for client_id in sorted(client_ids)]
+	cursor.executemany(sql, params)
+
+
+def upsert_stands(cursor, stand_ids: Set[int]) -> None:
+	if not stand_ids:
+		return
+
+	sql = "INSERT IGNORE INTO stands (stand_id) VALUES (%s)"
+	params = [(stand_id,) for stand_id in sorted(stand_ids)]
+	cursor.executemany(sql, params)
 
 
 # ---------------------------------------------------------------------------
@@ -434,10 +609,16 @@ def load_porto_csv(
 		connector = DbConnector()
 		cursor = connector.cursor
 		ensure_schema(cursor)
-		connector.db_connection.commit()
+		if connector.db_connection:
+			connector.db_connection.commit()
+		if cursor:
+			cursor.execute(f"SET SESSION innodb_lock_wait_timeout = {LOCK_WAIT_TIMEOUT_SECONDS}")
 
 	total_trips = 0
 	total_points = 0
+	total_valid_trips = 0
+	total_outliers = 0
+	total_missing = 0
 
 	for chunk_index, chunk in enumerate(read_csv_in_chunks(csv_path, chunk_size, limit), start=1):
 		logging.info("Processing chunk %s containing %s rows", chunk_index, len(chunk))
@@ -452,21 +633,63 @@ def load_porto_csv(
 
 		total_trips += len(trip_records)
 		total_points += len(point_records)
+		total_valid_trips += sum(1 for trip in trip_records if trip.is_valid)
+		total_outliers += sum(1 for trip in trip_records if trip.is_outlier)
+		total_missing += sum(1 for trip in trip_records if trip.missing_data)
 
-		if dry_run:
+		if dry_run or not trip_records:
 			continue
 
-		if not trip_records:
-			continue
-
+		taxi_ids = {trip.taxi_id for trip in trip_records}
+		client_ids = {trip.client_id for trip in trip_records if trip.client_id is not None}
+		stand_ids = {trip.stand_id for trip in trip_records if trip.stand_id is not None}
 		trip_ids = [trip.trip_id for trip in trip_records]
 
-		upsert_trips(cursor, trip_records)
-		delete_existing_points(cursor, trip_ids)
-		insert_trip_points(cursor, point_records)
-		connector.db_connection.commit()
+		attempt = 0
+		while True:
+			try:
+				upsert_taxis(cursor, taxi_ids)
+				upsert_clients(cursor, client_ids)
+				upsert_stands(cursor, stand_ids)
+				upsert_trips(cursor, trip_records)
+				delete_existing_points(cursor, trip_ids)
+				insert_trip_points(cursor, point_records)
+				if connector and connector.db_connection:
+					connector.db_connection.commit()
+				logging.debug(
+					"Chunk %s committed successfully on attempt %s",
+					chunk_index,
+					attempt + 1,
+				)
+				break
+			except mysql_errors.DatabaseError as err:  # noqa: BLE001
+				errno = getattr(err, "errno", None)
+				if connector and connector.db_connection:
+					connector.db_connection.rollback()
+				if errno in DB_LOCK_RETRY_ERRNOS and attempt < MAX_DB_RETRIES:
+					attempt += 1
+					delay = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+					logging.warning(
+						"Database lock (errno=%s) on chunk %s attempt %s/%s; retrying in %.1fs",
+						errno,
+						chunk_index,
+						attempt,
+						MAX_DB_RETRIES,
+						delay,
+					)
+					time.sleep(delay)
+					continue
+				logging.error("Database operation failed for chunk %s: %s", chunk_index, err)
+				raise
 
-	logging.info("Finished processing: %s trips, %s points", total_trips, total_points)
+	logging.info(
+		"Finished processing: %s trips (%s valid, %s missing flag, %s outliers), %s points",
+		total_trips,
+		total_valid_trips,
+		total_missing,
+		total_outliers,
+		total_points,
+	)
 
 	if connector is not None:
 		connector.close_connection()
