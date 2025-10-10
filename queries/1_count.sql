@@ -1,0 +1,6 @@
+SELECT COUNT(DISTINCT taxi_id) FROM trips
+GO
+SELECT COUNT(*) FROM trips
+GO
+SELECT COUNT(*) FROM trip_points
+GO
